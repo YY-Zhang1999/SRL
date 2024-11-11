@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, Tuple, Any, Optional
 from dataclasses import dataclass
-
+from .barrier_loss import BarrierLoss, PolicyLoss, ValueLoss
 
 @dataclass
 class LossInfo:
@@ -33,7 +34,7 @@ class LossInfo:
     lagrange_multiplier: float = 0.0
 
 
-class SRLNBCLoss(nn.Module):
+class PPONBCLoss(nn.Module):
     """
     Unified interface for SRLNBC (Safe RL with Neural Barrier Certificate) losses.
     Combines policy, value, and barrier losses with proper weighting and logging.
@@ -47,8 +48,6 @@ class SRLNBCLoss(nn.Module):
             config: Configuration dictionary containing loss parameters
         """
         super().__init__()
-
-        from .barrier_loss import BarrierLoss, PolicyLoss, ValueLoss
 
         # Initialize individual loss functions
         self.barrier_loss = BarrierLoss(config)
@@ -158,6 +157,218 @@ class SRLNBCLoss(nn.Module):
             "lagrange_multiplier": self.lagrange_multiplier.item()
         }
 
+
+class SRLNBCLoss(nn.Module):
+    """
+    SRLNBC Loss implementation for TD3 with importance sampling and Lagrangian relaxation.
+    Implements Equations (13) and (14) from the paper.
+    """
+
+    def __init__(
+            self,
+            config: Dict[str, Any],
+    ):
+        """
+        Initialize loss components.
+
+        Args:
+            config: Configuration dictionary containing:
+                - lambda_barrier: Weight for barrier loss
+                - n_barrier_steps: Number of steps for multi-step barrier
+                - gamma_barrier: Discount factor for barrier steps
+                - target_policy_noise: Target policy noise std
+                - target_noise_clip: Target policy noise clip
+                - policy_delay: Policy update delay steps
+                - device: Computation device
+        """
+        super().__init__()
+        self.lambda_barrier = config["lambda_barrier"]
+        #self.n_barrier_steps = config["n_barrier_steps"]
+        self.n_barrier_steps = 1
+        self.gamma_barrier = config["gamma_barrier"]
+        self.target_policy_noise = config["target_policy_noise"]
+        self.target_noise_clip = config["target_noise_clip"]
+        self.policy_delay = config["policy_delay"]
+        self.device = config["device"]
+
+        # Initialize Lagrange multiplier
+        self.lagrange_multiplier = nn.Parameter(torch.tensor(1.0))
+        self.lambda_lr = 1e-3
+
+        # Initialize individual loss functions
+        self.barrier_loss = BarrierLoss(config)
+
+    def compute_importance_weights(
+            self,
+            current_policy: nn.Module,
+            old_policy: nn.Module,
+            observations: torch.Tensor,
+            actions: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute importance sampling weights.
+
+        Args:
+            current_policy: Current policy network
+            old_policy: Old policy network that collected the data
+            observations: Current observations
+            actions: Current actions
+
+        Returns:
+            importance_weights: Importance sampling weights
+        """
+
+        with torch.no_grad():
+            current_log_prob = self._get_log_prob(current_policy, observations, actions)
+            old_log_prob = self._get_log_prob(old_policy, observations, actions)
+            importance_weights = torch.exp(current_log_prob - old_log_prob)
+
+            # Clip importance weights for stability
+            importance_weights = torch.clamp(importance_weights, 0.1, 10.0)
+
+        return importance_weights.mean()
+
+    def _get_log_prob(self, policy: nn.Module, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """log probability computation."""
+        mean = policy.forward(obs)
+        return -0.5 * ((actions - mean) ** 2).sum(dim=-1)
+
+    def compute_barrier_penalty(
+            self,
+            barrier_values: torch.Tensor,
+            next_barrier_values: torch.Tensor,
+            episode_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute barrier penalty with multi-step invariant loss.
+
+        Args:
+            barrier_values: Current barrier values of current observations
+            next_barrier_values: Next barrier values of next observations
+            observations: Current observations
+            next_observations: Next observations
+            importance_weights: Importance sampling weights
+            episode_mask: Episode boundary mask
+
+        Returns:
+            barrier_penalty: Weighted barrier penalty
+        """
+
+        barrier_penalty = self.barrier_loss.invariant_loss(
+            barrier_values=barrier_values,
+            next_barrier_values=next_barrier_values,
+            episode_mask=episode_mask
+        )
+        return barrier_penalty
+
+    def compute_barrier_loss(self,
+                             barrier_values: torch.Tensor,
+                             next_barrier_values: torch.Tensor,
+                             feasible_mask: torch.Tensor,
+                             infeasible_mask: torch.Tensor,
+                             episode_mask: torch.Tensor
+                             ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute total barrier loss and individual components.
+
+        Args:
+            barrier_values: Current state barrier values
+            next_barrier_values: Next state barrier values
+            feasible_mask: Binary mask indicating feasible states
+            infeasible_mask: Binary mask indicating infeasible states
+            episode_mask: Binary mask indicating episode boundaries
+
+        Returns:
+            total_loss: Combined barrier loss
+            loss_dict: Dictionary containing individual loss components
+        """
+        return self.barrier_loss(
+            barrier_values=barrier_values,
+            next_barrier_values=next_barrier_values,
+            feasible_mask=feasible_mask,
+            infeasible_mask=infeasible_mask,
+            episode_mask=episode_mask
+        )
+
+
+    def forward(
+            self,
+            barrier_values: torch.Tensor,
+            next_barrier_values: torch.Tensor,
+            feasible_mask: torch.Tensor,
+            infeasible_mask: torch.Tensor,
+            observations: torch.Tensor,
+            episode_mask: torch.Tensor,
+            actions: torch.Tensor,
+            current_policy: nn.Module,
+            old_policy: nn.Module,
+            critic_loss: torch.Tensor,
+            actor_loss: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, LossInfo]:
+        """
+        Compute combined loss using Lagrangian relaxation.
+
+        Args:
+            barrier_values: Current state barrier values
+            next_barrier_values: Next state barrier values
+            feasible_mask: Binary mask indicating feasible states
+            infeasible_mask: Binary mask indicating infeasible states
+            current_policy: Current policy network
+            old_policy: Old policy network
+
+        Returns:
+            total_loss: Combined loss for optimization
+            barrier_loss: total barrier loss
+            loss_info: Detailed loss information
+        """
+
+        # Compute importance weights
+        importance_weights = self.compute_importance_weights(
+            current_policy=current_policy,
+            old_policy=old_policy,
+            observations=observations,
+            actions=actions
+        )
+
+        # Compute barrier penalty
+        barrier_loss, barrier_info = self.compute_barrier_loss(
+            barrier_values=barrier_values,
+            next_barrier_values=next_barrier_values,
+            feasible_mask=feasible_mask,
+            infeasible_mask=infeasible_mask,
+            episode_mask=episode_mask
+        )
+
+        barrier_penalty = importance_weights * barrier_info["invariant_loss"]
+
+        # Compute Lagrangian dual loss
+        dual_loss = self.lagrange_multiplier * barrier_penalty
+
+        # Combine losses using Lagrangian relaxation
+        actor_loss = torch.as_tensor(actor_loss, device=self.device)
+        total_loss = actor_loss + dual_loss
+
+        # Update Lagrange multiplier
+        with torch.no_grad():
+            self.lagrange_multiplier.data.add_(
+                self.lambda_lr * total_loss.detach()
+            )
+            self.lagrange_multiplier.data.clamp_(min=0.0)
+
+        # Create loss info
+        loss_info = LossInfo(
+            total_loss=total_loss.item(),
+            policy_loss=actor_loss.item(),
+            value_loss=critic_loss.item(),
+            barrier_loss=barrier_loss.item(),
+            barrier_penalty=barrier_penalty.item(),
+            feasible_loss=barrier_info["feasible_loss"],
+            infeasible_loss=barrier_info["infeasible_loss"],
+            invariant_loss=barrier_info["invariant_loss"],
+            lagrange_multiplier=self.lagrange_multiplier.item(),
+        )
+
+        return total_loss, barrier_loss, loss_info
 
 class SRLNBCLossWrapper:
     """

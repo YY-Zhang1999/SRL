@@ -16,9 +16,9 @@ from stable_baselines3.common.torch_layers import (
     NatureCNN,
     create_mlp
 )
+from stable_baselines3.common.policies import BasePolicy
 
-
-class BarrierNetwork(nn.Module):
+class BarrierNetwork(BasePolicy):
     """
     Neural Barrier Certificate network that learns a state-based safety measure.
     Compatible with stable-baselines3 architecture and feature extractors.
@@ -32,6 +32,7 @@ class BarrierNetwork(nn.Module):
     def __init__(
             self,
             observation_space: gym.spaces.Space,
+            action_space: gym.spaces.Space,
             features_extractor: Type[BaseFeaturesExtractor] = FlattenExtractor,
             features_dim: int = None,
             hidden_sizes: List[int] = [64, 64],
@@ -51,10 +52,16 @@ class BarrierNetwork(nn.Module):
             device: Device to use for computation
             **kwargs: Additional arguments for feature extractor
         """
-        super().__init__()
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=features_extractor,
+            normalize_images=normalize_images,
+            squash_output=True,
+        )
 
         self.normalize_images = normalize_images
-        self.device = get_device(device)
+        #self.device = get_device(device)
 
         # Initialize feature extractor
         self.features_extractor = features_extractor(observation_space, **kwargs)
@@ -63,15 +70,19 @@ class BarrierNetwork(nn.Module):
         # Create barrier MLP
         self.barrier_net = self.create_barrier_network(
             input_dim=self.features_dim,
-            hidden_sizes=hidden_sizes
+            hidden_sizes=hidden_sizes,
         )
 
-        self.to(self.device)
+
+        #self.to(self.device)
 
     def create_barrier_network(
             self,
             input_dim: int,
-            hidden_sizes: List[int]
+            hidden_sizes: List[int],
+            squash_output: bool = False,
+            with_bias: bool = True,
+
     ) -> nn.Module:
         """
         Create the barrier MLP network.
@@ -79,6 +90,9 @@ class BarrierNetwork(nn.Module):
         Args:
             input_dim: Input dimension
             hidden_sizes: List of hidden layer sizes
+            activation_fn: The activation function to use after each layer.
+            squash_output: Whether to squash the output using a Tanh activation function
+            with_bias: If set to False, the layers will not learn an additive bias
 
         Returns:
             Barrier MLP network
@@ -89,13 +103,16 @@ class BarrierNetwork(nn.Module):
 
         for hidden_size in hidden_sizes:
             layers.extend([
-                nn.Linear(current_dim, hidden_size),
+                nn.Linear(current_dim, hidden_size, bias=with_bias),
                 nn.Tanh(),  # Use Tanh for better gradient properties
             ])
             current_dim = hidden_size
 
         # Output layer (scalar value)
-        layers.append(nn.Linear(current_dim, 1))
+        layers.append(nn.Linear(current_dim, 1, bias=with_bias))
+
+        if squash_output:
+            layers.append(nn.Tanh())
 
         return nn.Sequential(*layers)
 
@@ -209,6 +226,9 @@ class BarrierNetwork(nn.Module):
             }
 
         return is_safe, info
+
+    def _predict(self, observation: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        return self(observation)
 
 
 class ContinuousBarrierNetwork(BarrierNetwork):

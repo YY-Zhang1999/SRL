@@ -19,7 +19,7 @@ class BarrierLoss:
         Args:
             config: Configuration dictionary containing barrier parameters
         """
-        self.epsilon = 1e-6  # Small constant for numerical stability
+        self.epsilon = 1e-8  # Small constant for numerical stability
         self.lambda_barrier = config["lambda_barrier"]
         self.n_barrier_steps = config["n_barrier_steps"]
         self.gamma_barrier = config["gamma_barrier"]
@@ -79,7 +79,7 @@ class BarrierLoss:
         batch_size = barrier_values.shape[0]
 
         # Convert episode mask to boolean and handle shifting
-        mask = ~episode_mask[:-1].bool()
+        mask = episode_mask.bool()
 
         for i in range(self.n_barrier_steps):
             # Compute target coefficient based on barrier lambda
@@ -89,8 +89,8 @@ class BarrierLoss:
             epsilon_term = self.epsilon * (1 - target_coeff) / self.lambda_barrier
 
             # Get relevant slices of barrier values
-            future_barriers = next_barrier_values[i + 1:]
-            current_barriers = barrier_values[:-i - 1]
+            future_barriers = next_barrier_values
+            current_barriers = barrier_values
 
             # Compute invariant constraint violation
             inv_loss = torch.maximum(
@@ -102,8 +102,8 @@ class BarrierLoss:
             inv_loss = (1 - mask.float()) * inv_loss
 
             # Update mask for next step
-            if i < self.n_barrier_steps - 1:
-                mask = mask[:-1] | mask[1:]
+            #if i < self.n_barrier_steps - 1:
+            #    mask = mask[:-1] | mask[1:]
 
             # Compute mean loss for this step
             step_loss = torch.mean(inv_loss)
@@ -152,7 +152,7 @@ class BarrierLoss:
             "feasible_loss": feas_loss.item(),
             "infeasible_loss": infeas_loss.item(),
             "invariant_loss": inv_loss.item(),
-            "total_barrier_loss": total_loss.item()
+            "barrier_loss": total_loss.item()
         }
 
         return total_loss, loss_dict
@@ -332,3 +332,5 @@ class ValueLoss:
         loss_dict = {"value_loss": value_loss.item()}
 
         return value_loss, loss_dict
+
+

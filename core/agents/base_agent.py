@@ -1,15 +1,23 @@
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import os
 import numpy as np
 import torch as th
 import gym
+
 from gym import spaces
 
-from stable_baselines3.common.noise import ActionNoise
+from SRL.core.utils.buffers import SafeReplayBufferSamples, SafeReplayBuffer
+
+from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, RolloutReturn, TrainFreq, \
+    TrainFrequencyUnit
+from stable_baselines3.common.utils import get_parameters_by_name, polyak_update, should_collect_more_steps
+from stable_baselines3.common.vec_env import VecEnv
+
 
 
 class BaseAgent(OffPolicyAlgorithm):
@@ -30,6 +38,8 @@ class BaseAgent(OffPolicyAlgorithm):
             gamma: float = 0.99,
             train_freq: Union[int, Tuple[int, str]] = (1, "step"),
             gradient_steps: int = 1,
+            replay_buffer_class: Optional[Type[SafeReplayBuffer]] = None,
+            replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
             action_noise: Optional[ActionNoise] = None,
             optimize_memory_usage: bool = False,
             policy_delay: int = 2,
@@ -42,6 +52,7 @@ class BaseAgent(OffPolicyAlgorithm):
             device: Union[th.device, str] = "auto",
             _init_setup_model: bool = True,
             supported_action_spaces: Optional[Tuple[Type[spaces.Space], ...]] = None,
+            sde_support=False,
     ):
         """
         Initialize the base agent.
@@ -70,6 +81,7 @@ class BaseAgent(OffPolicyAlgorithm):
             _init_setup_model: Whether to build the network at initialization
             supported_action_spaces: Supported action spaces
         """
+
         super().__init__(
             policy=policy,
             env=env,
@@ -81,13 +93,15 @@ class BaseAgent(OffPolicyAlgorithm):
             gamma=gamma,
             train_freq=train_freq,
             gradient_steps=gradient_steps,
+            replay_buffer_class=replay_buffer_class,
+            replay_buffer_kwargs=replay_buffer_kwargs,
             action_noise=action_noise,
             policy_kwargs=policy_kwargs,
             tensorboard_log=tensorboard_log,
             verbose=verbose,
             device=device,
             seed=seed,
-            sde_support=False,
+            sde_support=sde_support,
             optimize_memory_usage=optimize_memory_usage,
             supported_action_spaces=supported_action_spaces or (spaces.Box),
             support_multi_env=True,
@@ -191,76 +205,193 @@ class BaseAgent(OffPolicyAlgorithm):
             tau=1.0
         )
 
-    def _sample_action(
-            self,
-            learning_starts: int,
-            action_noise: Optional[ActionNoise] = None,
-            n_envs: int = 1,
-    ) -> np.ndarray:
-        """
-        Sample actions with noise for exploration.
-
-        Args:
-            learning_starts: Number of steps before learning starts
-            action_noise: Action noise object
-            n_envs: Number of environments
-
-        Returns:
-            actions: Sampled actions
-        """
-        if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
-            # Warmup phase: sample random actions
-            unscaled_action = np.array([self.action_space.sample() for _ in range(n_envs)])
-        else:
-            # Sample actions from policy
-            unscaled_action = self.predict(self._last_obs, deterministic=False)[0]
-
-        # Add noise if specified
-        if action_noise is not None:
-            unscaled_action = np.clip(
-                unscaled_action + action_noise(),
-                -1,
-                1
-            )
-
-        return unscaled_action
-
-    def _excluded_save_params(self) -> List[str]:
-        """Parameters to exclude when saving."""
-        return super()._excluded_save_params() + [
-            "actor",
-            "critic",
-            "actor_target",
-            "critic_target"
-        ]
-
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        """Parameters to save in state_dict."""
-        state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
-        return state_dicts, []
-
-    def save(
-            self,
-            path: str,
-            exclude: Optional[List[str]] = None,
-            include: Optional[List[str]] = None,
+    def _store_safe_transition(
+        self,
+        replay_buffer: ReplayBuffer,
+        buffer_action: np.ndarray,
+        new_obs: Union[np.ndarray, Dict[str, np.ndarray]],
+        reward: np.ndarray,
+        dones: np.ndarray,
+        feasible_mask: np.ndarray,
+        infeasible_mask: np.ndarray,
+        infos: List[Dict[str, Any]],
     ) -> None:
         """
-        Save the model.
+        Store transition in the replay buffer.
+        We store the normalized action and the unnormalized observation.
+        It also handles terminal observations (because VecEnv resets automatically).
 
-        Args:
-            path: Path to save to
-            exclude: List of parameters to exclude
-            include: List of parameters to include
+        :param replay_buffer: Replay buffer object where to store the transition.
+        :param buffer_action: normalized action
+        :param new_obs: next observation in the current episode
+            or first observation of the episode (when dones is True)
+        :param reward: reward for the current transition
+        :param dones: Termination signal
+        :param infos: List of additional information about the transition.
+            It may contain the terminal observations and information about timeout.
         """
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Store only the unnormalized version
+        if self._vec_normalize_env is not None:
+            new_obs_ = self._vec_normalize_env.get_original_obs()
+            reward_ = self._vec_normalize_env.get_original_reward()
+        else:
+            # Avoid changing the original ones
+            self._last_original_obs, new_obs_, reward_ = self._last_obs, new_obs, reward
 
-        super().save(
-            path=path,
-            exclude=exclude,
-            include=include
+        # Avoid modification by reference
+        next_obs = deepcopy(new_obs_)
+        # As the VecEnv resets automatically, new_obs is already the
+        # first observation of the next episode
+        for i, done in enumerate(dones):
+            if done and infos[i].get("terminal_observation") is not None:
+                if isinstance(next_obs, dict):
+                    next_obs_ = infos[i]["terminal_observation"]
+                    # VecNormalize normalizes the terminal observation
+                    if self._vec_normalize_env is not None:
+                        next_obs_ = self._vec_normalize_env.unnormalize_obs(next_obs_)
+                    # Replace next obs for the correct envs
+                    for key in next_obs.keys():
+                        next_obs[key][i] = next_obs_[key]
+                else:
+                    next_obs[i] = infos[i]["terminal_observation"]
+                    # VecNormalize normalizes the terminal observation
+                    if self._vec_normalize_env is not None:
+                        next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])
+
+        replay_buffer.add(
+            self._last_original_obs,
+            next_obs,
+            buffer_action,
+            reward_,
+            dones,
+            feasible_mask,
+            infeasible_mask,
+            infos,
         )
+
+        self._last_obs = new_obs
+        # Save the unnormalized observation
+        if self._vec_normalize_env is not None:
+            self._last_original_obs = new_obs_
+
+    def collect_rollouts(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        train_freq: TrainFreq,
+        replay_buffer: ReplayBuffer,
+        action_noise: Optional[ActionNoise] = None,
+        learning_starts: int = 0,
+        log_interval: Optional[int] = None,
+    ) -> RolloutReturn:
+        """
+        Collect experiences and store them into a ``ReplayBuffer``.
+
+        :param env: The training environment
+        :param callback: Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param train_freq: How much experience to collect
+            by doing rollouts of current policy.
+            Either ``TrainFreq(<n>, TrainFrequencyUnit.STEP)``
+            or ``TrainFreq(<n>, TrainFrequencyUnit.EPISODE)``
+            with ``<n>`` being an integer greater than 0.
+        :param action_noise: Action noise that will be used for exploration
+            Required for deterministic policy (e.g. TD3). This can also be used
+            in addition to the stochastic policy for SAC.
+        :param learning_starts: Number of steps before learning for the warm-up phase.
+        :param replay_buffer:
+        :param log_interval: Log data every ``log_interval`` episodes
+        :return:
+        """
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(False)
+
+        num_collected_steps, num_collected_episodes = 0, 0
+
+        assert isinstance(env, VecEnv), "You must pass a VecEnv"
+        assert train_freq.frequency > 0, "Should at least collect one step or episode."
+
+        if env.num_envs > 1:
+            assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
+
+        # Vectorize action noise if needed
+        if action_noise is not None and env.num_envs > 1 and not isinstance(action_noise, VectorizedActionNoise):
+            action_noise = VectorizedActionNoise(action_noise, env.num_envs)
+
+        if self.use_sde:
+            self.actor.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+        continue_training = True
+        while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
+            if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.actor.reset_noise(env.num_envs)
+
+            # Select action randomly or according to policy
+            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
+
+            # Rescale and perform action
+            new_obs, rewards, dones, infos = env.step(actions)
+
+            self.num_timesteps += env.num_envs
+            num_collected_steps += 1
+
+            # Give access to local variables
+            callback.update_locals(locals())
+            # Only stop training if return value is False, not when it is None.
+            if callback.on_step() is False:
+                return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
+
+            # Retrieve reward and episode length if using Monitor wrapper
+            self._update_info_buffer(infos, dones)
+
+            # Extract safety information
+            total_cost = np.array([info.get("cost", 0) for info in infos])
+
+            if total_cost.shape[0] != buffer_actions.shape[0]:
+                raise ValueError(
+                    f"Cost size mismatch: "                    
+                    f"\nCost shape: {total_cost.shape}"
+                    f"\nAction shape: {actions.shape}"
+                )
+
+            infeasible_mask = total_cost > 0
+            feasible_mask = ~infeasible_mask
+
+            # Reshape masks once at the end if needed
+            if len(infeasible_mask.shape) == 1:
+                infeasible_mask = infeasible_mask.reshape(1, -1)
+                feasible_mask = feasible_mask.reshape(1, -1)
+
+            # Store data in replay buffer (normalized action and unnormalized observation)
+            self._store_safe_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, feasible_mask, infeasible_mask, infos)
+
+            self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
+
+            # For DQN, check if the target network should be updated
+            # and update the exploration schedule
+            # For SAC/TD3, the update is dones as the same time as the gradient update
+            # see https://github.com/hill-a/stable-baselines/issues/900
+            self._on_step()
+
+            for idx, done in enumerate(dones):
+                if done:
+                    # Update stats
+                    num_collected_episodes += 1
+                    self._episode_num += 1
+
+                    if action_noise is not None:
+                        kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
+                        action_noise.reset(**kwargs)
+
+                    # Log training infos
+                    if log_interval is not None and self._episode_num % log_interval == 0:
+                        self._dump_logs()
+        callback.on_rollout_end()
+
+        return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
+
 
     def _get_safe_action(
             self,

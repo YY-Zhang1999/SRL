@@ -3,19 +3,19 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import numpy as np
 import torch as th
 import torch.nn.functional as F
-from gym import spaces
 
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import polyak_update
+from stable_baselines3.common.utils import polyak_update, get_parameters_by_name
 from stable_baselines3.common.callbacks import BaseCallback
 
 from .base_agent import BaseAgent
 from ..models.barrier import BarrierNetwork
 from ..losses.losses import SRLNBCLoss
+from ..utils.buffers import SafeReplayBuffer
+from ..models.TD3_barrier_policy import SafeTD3Policy
 
-
-class TD3SafeAgent(BaseAgent):
+class Safe_TD3(BaseAgent):
     """
     Twin Delayed DDPG (TD3) agent with safety constraints through barrier certificates.
     """
@@ -30,9 +30,11 @@ class TD3SafeAgent(BaseAgent):
             batch_size: int = 256,
             tau: float = 0.005,
             gamma: float = 0.99,
-            train_freq: Union[int, Tuple[int, str]] = (1, "step"),
-            gradient_steps: int = 1,
+            train_freq: Union[int, Tuple[int, str]] = (1, "episode"),
+            gradient_steps: int = -1,
             action_noise: Optional[ActionNoise] = None,
+            replay_buffer_class: Optional[Type[SafeReplayBuffer]] = SafeReplayBuffer,
+            replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
             optimize_memory_usage: bool = False,
             policy_delay: int = 2,
             target_policy_noise: float = 0.2,
@@ -43,7 +45,7 @@ class TD3SafeAgent(BaseAgent):
             seed: Optional[int] = None,
             device: Union[th.device, str] = "auto",
             barrier_lambda: float = 0.1,
-            n_barrier_steps: int = 20,
+            n_barrier_steps: int = 1,
             gamma_barrier: float = 0.99,
             safety_margin: float = 0.1,
             _init_setup_model: bool = True,
@@ -57,6 +59,9 @@ class TD3SafeAgent(BaseAgent):
             gamma_barrier: Discount factor for multi-step barrier
             safety_margin: Minimum safety margin
         """
+        if policy == "SafeTD3Policy":
+            policy = SafeTD3Policy
+
         super().__init__(
             policy=policy,
             env=env,
@@ -69,13 +74,15 @@ class TD3SafeAgent(BaseAgent):
             train_freq=train_freq,
             gradient_steps=gradient_steps,
             action_noise=action_noise,
+            replay_buffer_class=replay_buffer_class,
+            replay_buffer_kwargs=replay_buffer_kwargs,
             policy_kwargs=policy_kwargs,
             tensorboard_log=tensorboard_log,
             verbose=verbose,
             device=device,
             seed=seed,
+            sde_support=False,
             optimize_memory_usage=optimize_memory_usage,
-            supported_action_spaces=(spaces.Box),
             _init_setup_model=False,
         )
 
@@ -116,6 +123,12 @@ class TD3SafeAgent(BaseAgent):
             "device": self.device
         }).to(self.device)
 
+        # Running mean and running var
+        self.actor_batch_norm_stats = get_parameters_by_name(self.actor, ["running_"])
+        self.critic_batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
+        self.actor_batch_norm_stats_target = get_parameters_by_name(self.actor_target, ["running_"])
+        self.critic_batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
+
     def train(self, gradient_steps: int, batch_size: int = 256) -> None:
         """
         Training loop for TD3 with safety considerations.
@@ -151,7 +164,8 @@ class TD3SafeAgent(BaseAgent):
             # Update critics and barrier certificate
             with th.no_grad():
                 # Get noisy target actions
-                noise = th.randn_like(replay_data.actions) * self.target_policy_noise
+                #noise = th.randn_like(replay_data.actions) * self.target_policy_noise
+                noise = replay_data.actions.clone().data.normal_(0, self.target_policy_noise)
                 noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
                 next_actions = (
                         self.actor_target(replay_data.next_observations) + noise
@@ -199,29 +213,27 @@ class TD3SafeAgent(BaseAgent):
                 barrier_values = self.policy.barrier_net(replay_data.observations)
                 next_barrier_values = self.policy.barrier_net(replay_data.next_observations)
 
-                barrier_loss, barrier_info = self.loss_fn(
-                    batch={
-                        "observations": replay_data.observations,
-                        "actions": replay_data.actions,
-                        "next_observations": replay_data.next_observations,
-                        "rewards": replay_data.rewards,
-                        "dones": replay_data.dones,
-                        "barrier_values": barrier_values,
-                        "next_barrier_values": next_barrier_values,
-                    },
-                    policy_net=self.actor,
-                    barrier_net=self.policy.barrier_net,
-                    value_net=self.critic
+                total_loss, barrier_loss, info = self.loss_fn(
+                    barrier_values=barrier_values,
+                    next_barrier_values=next_barrier_values,
+                    feasible_mask=replay_data.feasible_mask,
+                    infeasible_mask=replay_data.infeasible_mask,
+                    observations=replay_data.observations,
+                    episode_mask=replay_data.dones,
+                    actions=replay_data.actions,
+                    current_policy=self.actor,
+                    old_policy=self.policy.actor_target,
+                    critic_loss=critic_loss,
+                    actor_loss=actor_loss,
                 )
-
-                # Combined loss
-                total_loss = actor_loss + barrier_loss
 
                 # Optimize actor and barrier
                 self.actor.optimizer.zero_grad()
-                self.policy.barrier_net.optimizer.zero_grad()
                 total_loss.backward()
                 self.actor.optimizer.step()
+
+                self.policy.barrier_net.optimizer.zero_grad()
+                barrier_loss.backward()
                 self.policy.barrier_net.optimizer.step()
 
                 # Update target networks
@@ -229,7 +241,7 @@ class TD3SafeAgent(BaseAgent):
 
                 # Store losses
                 actor_losses.append(actor_loss.item())
-                barrier_losses.append(barrier_info.barrier_loss)
+                barrier_losses.append(barrier_loss.item())
 
                 # Compute safety violations
                 safety_violation = (barrier_values > 0).float().mean().item()
@@ -263,7 +275,8 @@ class TD3SafeAgent(BaseAgent):
     def _get_safe_action(
             self,
             observations: th.Tensor,
-            actions: th.Tensor
+            actions: th.Tensor,
+            safe_mode: bool = False,
     ) -> th.Tensor:
         """
         Get safe actions by checking barrier certificate.
@@ -275,6 +288,9 @@ class TD3SafeAgent(BaseAgent):
         Returns:
             Safe actions
         """
+        if not safe_mode:
+            return actions
+
         with th.no_grad():
             barrier_values = self.policy.barrier_net(observations)
             unsafe_mask = barrier_values > -self.safety_margin
@@ -317,6 +333,7 @@ class TD3SafeAgent(BaseAgent):
             state: Optional[Tuple[np.ndarray, ...]] = None,
             episode_start: Optional[np.ndarray] = None,
             deterministic: bool = False,
+            safe_mode: bool = False
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         """
         Get action with safety check.
@@ -331,9 +348,9 @@ class TD3SafeAgent(BaseAgent):
             action: Selected action
             state: Updated state
         """
-        obs_tensor = th.as_tensor(observation).to(self.device)
-        with th.no_grad():
-            actions = self.actor(obs_tensor)
-            safe_actions = self._get_safe_action(obs_tensor, actions)
+        self.policy.set_training_mode(False)
 
-        return safe_actions.cpu().numpy(), state
+        actions = self.policy.predict(observation, state, episode_start, deterministic)
+        safe_actions, state = self._get_safe_action(observation, actions, safe_mode=safe_mode)
+
+        return safe_actions, state
