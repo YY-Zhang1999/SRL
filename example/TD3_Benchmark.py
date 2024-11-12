@@ -1,9 +1,11 @@
+import sys
+import gymnasium as gym
+sys.modules["gym"] = gym
+
 import argparse
 import numpy as np
 import torch
-import gym
-import safety_gym
-import safety_gymnasium
+
 from stable_baselines3 import TD3
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.noise import NormalActionNoise
@@ -18,6 +20,7 @@ import os
 
 from SRL.core.agents.safe_TD3 import Safe_TD3
 from SRL.core.utils.logger import Logger
+from SRL.core.utils.safety_gym_env import make_safety_env
 
 
 class BenchmarkRunner:
@@ -79,8 +82,7 @@ class BenchmarkRunner:
         Returns:
             Wrapped environment
         """
-        env = safety_gymnasium.make(env_id)
-        env = safety_gymnasium.wrappers.SafetyGymnasium2Gymnasium(env)
+        env = make_safety_env(env_id)
         env = Monitor(env)
         env = DummyVecEnv([lambda: env])
         env = VecNormalize(env, norm_obs=True, norm_reward=True)
@@ -156,7 +158,7 @@ class BenchmarkRunner:
             self,
             agent: Union[Safe_TD3, TD3],
             env: gym.Env,
-            n_eval_episodes: int = 10
+            n_eval_episodes: int = 5
     ) -> Dict[str, float]:
         """
         Evaluate agent performance.
@@ -183,6 +185,7 @@ class BenchmarkRunner:
             while not done:
                 action, _ = agent.predict(obs, deterministic=True)
                 obs, reward, done, info = env.step(action)
+                info = info[0]
                 episode_reward += reward
                 if "cost" in info:
                     episode_cost += info["cost"]
@@ -255,14 +258,14 @@ class BenchmarkRunner:
         baseline_agent = self.setup_agent(env, is_safe=False)
         for timestep in range(0, total_timesteps, eval_freq):
             baseline_agent.learn(eval_freq, progress_bar=True)
-            metrics = self.evaluate(baseline_agent, env)
+            metrics_baseline = self.evaluate(baseline_agent, env)
 
-            history["baseline_rewards"].append(metrics["mean_reward"])
-            history["baseline_costs"].append(metrics["mean_cost"])
+            history["baseline_rewards"].append(metrics_baseline["mean_reward"])
+            history["baseline_costs"].append(metrics_baseline["mean_cost"])
 
             self.logger.log_eval({
-                "baseline_td3/reward": metrics["mean_reward"],
-                "baseline_td3/cost": metrics["mean_cost"],
+                "baseline_td3/reward": metrics_baseline["mean_reward"],
+                "baseline_td3/cost": metrics_baseline["mean_cost"],
                 "timestep": timestep
             })
 
@@ -350,9 +353,10 @@ class BenchmarkRunner:
 
 
 def main():
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--total_timesteps", type=int, default=1_000_000)
+    parser.add_argument("--total_timesteps", type=int, default=2_000_00)
     parser.add_argument("--eval_freq", type=int, default=10000)
     args = parser.parse_args()
 
@@ -365,13 +369,14 @@ def main():
     gym_envs = []
 
     safety_gym_envs = [
-        "Safexp-PointGoal1-v0",
-        "Safexp-CarGoal1-v0",
-        "Safexp-DoggoGoal1-v0"
+        "SafetyCarGoal0-v0",
+        "SafetyCarGoal1-v0",
+        "SafetyCarGoal2-v0"
     ]
 
     # Run benchmarks
     benchmark_runner = BenchmarkRunner(seed=args.seed)
+
     benchmark_runner.run_benchmarks(
         gym_envs=gym_envs,
         safety_gym_envs=safety_gym_envs,
