@@ -1,9 +1,11 @@
+from collections import deque
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import os
 import numpy as np
 import torch as th
 import gym
+from SRL.core.models.barrier import BarrierNetwork
 
 from gym import spaces
 
@@ -45,6 +47,7 @@ class BaseAgent(OffPolicyAlgorithm):
             policy_delay: int = 2,
             target_policy_noise: float = 0.2,
             target_noise_clip: float = 0.5,
+            n_barrier_steps: int = 20,
             tensorboard_log: Optional[str] = None,
             policy_kwargs: Optional[Dict[str, Any]] = None,
             verbose: int = 0,
@@ -111,6 +114,10 @@ class BaseAgent(OffPolicyAlgorithm):
         self.target_policy_noise = target_policy_noise
         self.target_noise_clip = target_noise_clip
 
+        # Set n_step
+        self.replay_buffer_kwargs["n_barrier_steps"] = n_barrier_steps
+        self.n_barrier_steps = n_barrier_steps
+
         if _init_setup_model:
             self._setup_model()
 
@@ -120,6 +127,13 @@ class BaseAgent(OffPolicyAlgorithm):
         """
         super()._setup_model()
         self._create_aliases()
+
+        if not hasattr(self.policy, "barrier_net"):
+            self.policy.barrier_net = BarrierNetwork(
+                observation_space=self.observation_space,
+                hidden_sizes=self.policy_kwargs.get("barrier_hidden_sizes", [400, 300]),
+                device=self.device
+            ).to(self.device)
 
         # Get running statistics for batch normalization
         self.actor_batch_norm_stats = get_parameters_by_name(self.actor, ["running_"])
@@ -205,6 +219,8 @@ class BaseAgent(OffPolicyAlgorithm):
             tau=1.0
         )
 
+
+
     def _store_safe_transition(
         self,
         replay_buffer: ReplayBuffer,
@@ -230,6 +246,7 @@ class BaseAgent(OffPolicyAlgorithm):
         :param infos: List of additional information about the transition.
             It may contain the terminal observations and information about timeout.
         """
+
         # Store only the unnormalized version
         if self._vec_normalize_env is not None:
             new_obs_ = self._vec_normalize_env.get_original_obs()
@@ -257,6 +274,8 @@ class BaseAgent(OffPolicyAlgorithm):
                     # VecNormalize normalizes the terminal observation
                     if self._vec_normalize_env is not None:
                         next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])
+
+
 
         replay_buffer.add(
             self._last_original_obs,
@@ -363,6 +382,8 @@ class BaseAgent(OffPolicyAlgorithm):
             if len(infeasible_mask.shape) == 1:
                 infeasible_mask = infeasible_mask.reshape(1, -1)
                 feasible_mask = feasible_mask.reshape(1, -1)
+
+            # Obtain epo
 
             # Store data in replay buffer (normalized action and unnormalized observation)
             self._store_safe_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, feasible_mask, infeasible_mask, infos)

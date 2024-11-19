@@ -24,10 +24,10 @@ class Safe_TD3(BaseAgent):
             self,
             policy: Union[str, Type["SafeTD3Policy"]],
             env: Union[GymEnv, str],
-            learning_rate: Union[float, Schedule] = 1e-3,
+            learning_rate: Union[float, Schedule] = 5e-4,
             buffer_size: int = 1_000_000,
             learning_starts: int = 100,
-            batch_size: int = 256,
+            batch_size: int = 64,
             tau: float = 0.005,
             gamma: float = 0.99,
             train_freq: Union[int, Tuple[int, str]] = (1, "episode"),
@@ -45,9 +45,10 @@ class Safe_TD3(BaseAgent):
             seed: Optional[int] = None,
             device: Union[th.device, str] = "auto",
             barrier_lambda: float = 0.1,
-            n_barrier_steps: int = 1,
+            n_barrier_steps: int = 10,
             gamma_barrier: float = 0.99,
             safety_margin: float = 0.1,
+            lambda_lr: float = 3e-2,
             _init_setup_model: bool = True,
     ):
         """
@@ -76,6 +77,7 @@ class Safe_TD3(BaseAgent):
             action_noise=action_noise,
             replay_buffer_class=replay_buffer_class,
             replay_buffer_kwargs=replay_buffer_kwargs,
+            n_barrier_steps=n_barrier_steps,
             policy_kwargs=policy_kwargs,
             tensorboard_log=tensorboard_log,
             verbose=verbose,
@@ -88,9 +90,9 @@ class Safe_TD3(BaseAgent):
 
         # Safety parameters
         self.barrier_lambda = barrier_lambda
-        self.n_barrier_steps = n_barrier_steps
         self.gamma_barrier = gamma_barrier
         self.safety_margin = safety_margin
+        self.lambda_lr = lambda_lr
 
         # TD3 specific parameters
         self.policy_delay = policy_delay
@@ -120,6 +122,7 @@ class Safe_TD3(BaseAgent):
             "policy_delay": self.policy_delay,
             "target_policy_noise": self.target_policy_noise,
             "target_noise_clip": self.target_noise_clip,
+            "lambda_lr": self.lambda_lr,
             "device": self.device
         }).to(self.device)
 
@@ -210,8 +213,7 @@ class Safe_TD3(BaseAgent):
                 ).mean()
 
                 # Get barrier values and compute barrier loss
-                barrier_values = self.policy.barrier_net(replay_data.observations)
-                next_barrier_values = self.policy.barrier_net(replay_data.next_observations)
+                barrier_values, next_barrier_values = self.get_barrier_values(replay_data.next_n_observations, self.policy.barrier_net)
 
                 total_loss, barrier_loss, info = self.loss_fn(
                     barrier_values=barrier_values,
@@ -219,7 +221,7 @@ class Safe_TD3(BaseAgent):
                     feasible_mask=replay_data.feasible_mask,
                     infeasible_mask=replay_data.infeasible_mask,
                     observations=replay_data.observations,
-                    episode_mask=replay_data.dones,
+                    episode_mask=replay_data.n_dones,
                     actions=replay_data.actions,
                     current_policy=self.actor,
                     old_policy=self.policy.actor_target,
@@ -244,8 +246,15 @@ class Safe_TD3(BaseAgent):
                 barrier_losses.append(barrier_loss.item())
 
                 # Compute safety violations
-                safety_violation = (barrier_values > 0).float().mean().item()
+                safety_violation = replay_data.infeasible_mask.float().mean().item()
                 safety_violations.append(safety_violation)
+
+                #if self.num_timesteps % 10000 == 0:
+                    #print(safety_violation, (barrier_values > 0).float().mean().item())
+                    #print(info)
+
+
+
 
         # Log training info
         self._log_training_info(
@@ -254,6 +263,46 @@ class Safe_TD3(BaseAgent):
             barrier_losses=barrier_losses,
             safety_violations=safety_violations
         )
+
+    def get_barrier_values(
+            self,
+            next_n_observations: th.Tensor,
+            barrier_net: th.nn.Module
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Compute barrier values for current and n-step future observations.
+
+        Args:
+            next_n_observations: Tensor of shape (n_steps, batch_size, *obs_shape)
+                               containing the next n observations
+            barrier_net: Neural network that computes barrier values
+
+        Returns:
+            barrier_values: Tensor of shape (batch_size, 1) containing current barrier values
+            next_barrier_values: Tensor of shape (n_steps, batch_size, 1)
+                               containing current and future barrier values
+        """
+        # Ensure the input is on the correct device
+        if not isinstance(next_n_observations, th.Tensor):
+            next_n_observations = th.tensor(next_n_observations)
+
+        next_n_observations = next_n_observations.to(self.device)
+
+        # Compute barrier values for all n-step observations at once
+        # Reshape to (n_steps * batch_size, *obs_shape)
+        n_steps, batch_size = next_n_observations.shape[:2]
+        reshaped_obs = next_n_observations.view(-1, *next_n_observations.shape[2:])
+
+        # Get all barrier values in one forward pass
+        all_barrier_values = barrier_net(reshaped_obs)
+
+        # Reshape back to (n_steps, batch_size, 1)
+        next_barrier_values = all_barrier_values.view(n_steps, batch_size, 1)
+
+        # Get current barrier values (first step)
+        barrier_values = next_barrier_values[0]  # Shape: (batch_size, 1)
+
+        return barrier_values, next_barrier_values
 
     def _log_training_info(
             self,

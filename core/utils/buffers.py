@@ -41,10 +41,14 @@ class SafeReplayBufferSamples(NamedTuple):
     observations: th.Tensor
     actions: th.Tensor
     next_observations: th.Tensor
+    next_n_observations: th.Tensor
     dones: th.Tensor
+    n_dones: th.Tensor
     rewards: th.Tensor
     feasible_mask: th.Tensor  # Feasible state mask
     infeasible_mask: th.Tensor  # Infeasible state mask
+    #barrier_values: th.Tensor
+    #next_barrier_values: th.Tensor
 
 
 class SafeReplayBuffer(BaseBuffer):
@@ -59,6 +63,7 @@ class SafeReplayBuffer(BaseBuffer):
             action_space: spaces.Space,
             device: Union[th.device, str] = "auto",
             n_envs: int = 1,
+            n_barrier_steps = 1,
             optimize_memory_usage: bool = False,
             handle_timeout_termination: bool = True,
     ):
@@ -113,8 +118,11 @@ class SafeReplayBuffer(BaseBuffer):
                 )
 
         # Safety-related buffers
+        self.n_barrier_size = n_barrier_steps
+        self.last_n_observations = np.zeros((self.buffer_size, self.n_envs, self.n_barrier_size), dtype=np.float32)
+
         #self.barrier_values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
-        #self.next_barrier_values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        #self.next_barrier_values = np.zeros((self.buffer_size, self.n_envs, self.n_barrier_size), dtype=np.float32)
         self.feasible_mask = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.infeasible_mask = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         #self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -127,6 +135,7 @@ class SafeReplayBuffer(BaseBuffer):
             self,
             obs: np.ndarray,
             next_obs: np.ndarray,
+            #last_n_obs: np.ndarray,
             action: np.ndarray,
             reward: np.ndarray,
             done: np.ndarray,
@@ -176,12 +185,16 @@ class SafeReplayBuffer(BaseBuffer):
         Sample experiences from buffer.
         """
         if not self.optimize_memory_usage:
-            return super().sample(batch_size=batch_size, env=env)
+            upper_bound = self.buffer_size if self.full else self.pos - self.n_barrier_size - 1
+            batch_inds = np.random.randint(0, upper_bound, size=batch_size)
 
-        if self.full:
-            batch_inds = (np.random.randint(1, self.buffer_size, size=batch_size) + self.pos) % self.buffer_size
         else:
-            batch_inds = np.random.randint(0, self.pos, size=batch_size)
+            if self.full:
+                batch_inds = (np.random.randint(1, self.buffer_size - self.n_barrier_size,
+                                                size=batch_size) + self.pos) % self.buffer_size
+            else:
+                batch_inds = np.random.randint(0, self.pos - self.n_barrier_size, size=batch_size)
+
         return self._get_samples(batch_inds, env=env)
 
     def _get_samples(
@@ -197,16 +210,24 @@ class SafeReplayBuffer(BaseBuffer):
 
         if self.optimize_memory_usage:
             next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
+            next_n_obs = np.array([self._normalize_obs(self.observations[(2 * i + batch_inds) % self.buffer_size, env_indices, :], env)
+                                   for i in range(1, self.n_barrier_size + 1)])
         else:
             next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+            next_n_obs = np.array([self._normalize_obs(self.observations[((i + batch_inds) % self.buffer_size) % self.buffer_size, env_indices, :], env)
+                                   for i in range(self.n_barrier_size + 1)])
 
         data = (
             self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
             self.actions[batch_inds, env_indices, :],
             next_obs,
+            next_n_obs,
             # Only use dones that are not due to timeouts
             # deactivated by default (timeouts is initialized as an array of False)
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+            np.array([(self.dones[(i + batch_inds) % self.buffer_size, env_indices] *
+                      (1 - self.timeouts[(i + batch_inds) % self.buffer_size, env_indices])).reshape(-1, 1) for i in
+                      range(self.n_barrier_size + 1)]),
             self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
             self.feasible_mask[batch_inds, env_indices].reshape(-1, 1),
             self.infeasible_mask[batch_inds, env_indices].reshape(-1, 1),

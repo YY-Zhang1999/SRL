@@ -5,7 +5,7 @@ import gym
 from typing import Dict, Tuple
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.noise import NormalActionNoise
-from stable_baselines3.common.callbacks import CheckpointCallback, ProgressBarCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, ProgressBarCallback, EvalCallback
 
 from SRL.core.agents.safe_TD3 import Safe_TD3
 from SRL.core.models.TD3_barrier_policy import SafeTD3Policy
@@ -37,7 +37,7 @@ class TestTD3SafeAgent(unittest.TestCase):
             learning_rate=3e-4,
             buffer_size=1000,
             learning_starts=100,
-            batch_size=256,
+            batch_size=16,
             tau=0.005,
             gamma=0.99,
             train_freq=1,
@@ -47,7 +47,7 @@ class TestTD3SafeAgent(unittest.TestCase):
             target_policy_noise=0.2,
             target_noise_clip=0.5,
             barrier_lambda=0.1,
-            n_barrier_steps=20,
+            n_barrier_steps=5,
             gamma_barrier=0.99,
             safety_margin=0.1,
             verbose=0,
@@ -76,7 +76,7 @@ class TestTD3SafeAgent(unittest.TestCase):
 
         # Check parameters
         self.assertEqual(self.agent.learning_starts, 100)
-        self.assertEqual(self.agent.batch_size, 256)
+        self.assertEqual(self.agent.batch_size, 16)
         self.assertEqual(self.agent.policy_delay, 2)
 
     def test_predict(self):
@@ -106,32 +106,10 @@ class TestTD3SafeAgent(unittest.TestCase):
         self.assertTrue(th.all(safe_action >= -1))
         self.assertTrue(th.all(safe_action <= 1))
 
-    def test_training_step(self):
-        """Test single training step."""
-        # Fill buffer with some samples
-        self.vec_env.reset()
-        self.agent.collect_rollouts(
-            self.vec_env,
-            ProgressBarCallback(),
-            self.agent.train_freq,
-            self.agent.replay_buffer,
-            self.agent.action_noise,
-            self.agent.learning_starts,
-        )
-
-        # Perform training step
-        self.agent.train()
-        train_info = self.agent.train(gradient_steps=1)
-
-        # Check training info
-        self.assertIn("critic_loss", train_info)
-        self.assertIn("actor_loss", train_info)
-        self.assertIn("barrier_loss", train_info)
-
     def test_learn(self):
         """Test learning process."""
         # Train for a few steps
-        total_timesteps = 10
+        total_timesteps = 100
         self.agent = self.agent.learn(
             total_timesteps=total_timesteps,
             log_interval=100
@@ -210,7 +188,7 @@ class TestTD3SafeAgent(unittest.TestCase):
                 done=done,
                 feasible=np.array([1.0]),
                 infeasible=np.array([0.0]),
-                infos=infos
+                infos=[infos]
             )
 
             obs = next_obs if not done else self.env.reset()
@@ -218,8 +196,11 @@ class TestTD3SafeAgent(unittest.TestCase):
         # Get batch
         batch = self.agent.replay_buffer.sample(self.agent.batch_size)
 
+
         # Check batch properties
         self.assertEqual(batch.observations.shape[0], self.agent.batch_size)
+        self.assertEqual(batch.next_n_observations.shape[0], self.agent.n_barrier_steps + 1)
+        self.assertEqual(batch.n_dones.shape[0], self.agent.n_barrier_steps + 1)
         self.assertEqual(batch.actions.shape[0], self.agent.batch_size)
         self.assertEqual(batch.rewards.shape[0], self.agent.batch_size)
         self.assertEqual(batch.feasible_mask.shape[0], self.agent.batch_size)

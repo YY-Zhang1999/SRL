@@ -21,6 +21,7 @@ class TestSafeBuffers(unittest.TestCase):
         # Buffer parameters
         self.buffer_size = 1000
         self.n_envs = 3
+        self.n_barrier_steps = 2
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
 
         # Initialize buffers
@@ -29,7 +30,8 @@ class TestSafeBuffers(unittest.TestCase):
             observation_space=env.observation_space,
             action_space=env.action_space,
             device=self.device,
-            n_envs=self.n_envs
+            n_envs=self.n_envs,
+            n_barrier_steps=self.n_barrier_steps,
         )
 
         # Sample data dimensions
@@ -95,10 +97,13 @@ class TestSafeBuffers(unittest.TestCase):
         self.assertEqual(samples.observations.shape, (batch_size, self.obs_dim))
         self.assertEqual(samples.actions.shape, (batch_size, self.action_dim))
         self.assertEqual(samples.next_observations.shape, (batch_size, self.obs_dim))
+        self.assertEqual(samples.next_n_observations.shape, (self.n_barrier_steps + 1, batch_size, self.obs_dim))
         self.assertEqual(samples.rewards.shape, (batch_size, 1))
         self.assertEqual(samples.dones.shape, (batch_size, 1))
+        self.assertEqual(samples.n_dones.shape, (self.n_barrier_steps + 1, batch_size))
         self.assertEqual(samples.feasible_mask.shape, (batch_size, 1))
         self.assertEqual(samples.infeasible_mask.shape, (batch_size, 1))
+
 
         # Check data types
         self.assertTrue(th.is_tensor(samples.observations))

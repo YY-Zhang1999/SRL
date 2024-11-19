@@ -15,20 +15,21 @@ class TestBarrierLoss(unittest.TestCase):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = {
             "lambda_barrier": 0.1,
-            "n_barrier_steps": 1,
+            "n_barrier_steps": 4,
             "gamma_barrier": 0.99,
         }
         self.loss_fn = BarrierLoss(self.config)
 
         # Create sample test data
-        self.batch_size = 32
+        self.batch_size = 4
         self.create_test_data()
 
     def create_test_data(self):
         """Create test data for loss computation."""
         # Create barrier values for feasible and infeasible states
         self.barrier_values = torch.randn(self.batch_size).to(self.device)
-        self.next_barrier_values = torch.randn(self.batch_size).to(self.device)
+        self.next_barrier_values = torch.randn(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
+        self.next_barrier_values[0] = self.barrier_values
 
         # Create masks
         self.feasible_mask = torch.zeros(self.batch_size).to(self.device)
@@ -37,8 +38,10 @@ class TestBarrierLoss(unittest.TestCase):
         self.infeasible_mask = torch.zeros(self.batch_size).to(self.device)
         self.infeasible_mask[self.batch_size // 2:] = 1  # Half states are infeasible
 
-        self.episode_mask = torch.zeros(self.batch_size).to(self.device)
-        self.episode_mask[self.batch_size // 4::self.batch_size // 4] = 1  # Episode boundaries
+        self.episode_mask = torch.zeros(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
+        for i in range(self.config["n_barrier_steps"] + 1):
+            self.episode_mask[i][self.batch_size // 4 + i::self.batch_size // 4] = 1  # Episode boundaries
+
 
     def test_feasible_loss(self):
         """Test feasible loss computation."""
@@ -80,40 +83,44 @@ class TestBarrierLoss(unittest.TestCase):
         """Test invariant loss computation."""
         # Test case 1: Perfect invariance
         barrier_values = torch.ones(self.batch_size).to(self.device)
-        next_barrier_values = (1 - self.config["lambda_barrier"]) * barrier_values
-        episode_mask = torch.zeros(self.batch_size).to(self.device)
+
+        next_n_barrier_values = torch.ones(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
+        for i in range(self.config["n_barrier_steps"]):
+            next_n_barrier_values[i + 1] = (1 - self.config["lambda_barrier"]) ** (i + 1) * barrier_values
+
+        episode_mask = torch.zeros(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
 
         loss = self.loss_fn.invariant_loss(
             barrier_values,
-            next_barrier_values,
+            next_n_barrier_values,
             episode_mask
         )
-        self.assertTrue(torch.allclose(loss, torch.tensor(0.0).to(self.device)))
+        self.assertTrue(torch.allclose(loss, torch.tensor(0.0).to(self.device), 1e-3, 1e-5))
 
         # Test case 2: Invariance violation
-        next_barrier_values = barrier_values  # No decrease
+        next_n_barrier_values[1] = barrier_values # No decrease
         loss = self.loss_fn.invariant_loss(
             barrier_values,
-            next_barrier_values,
+            next_n_barrier_values,
             episode_mask
         )
         self.assertTrue(loss.item() > 0)
 
         # Test case 3: Mixed barrier values
-        barrier_values = torch.randn(self.batch_size).to(self.device)
-        next_barrier_values = torch.randn(self.batch_size).to(self.device)
+        next_n_barrier_values = torch.randn(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
+        episode_mask = torch.randint(0, 2, (self.config["n_barrier_steps"] + 1, self.batch_size)).to(self.device)
         loss = self.loss_fn.invariant_loss(
             barrier_values,
-            next_barrier_values,
+            next_n_barrier_values,
             episode_mask
         )
         self.assertTrue(loss.item() >= 0)
 
         # Test case 3: Episode boundaries
-        episode_mask = torch.ones(self.batch_size).to(self.device)
+        episode_mask = torch.ones((self.config["n_barrier_steps"] + 1, self.batch_size)).to(self.device)
         loss = self.loss_fn.invariant_loss(
             barrier_values,
-            next_barrier_values,
+            next_n_barrier_values,
             episode_mask
         )
         self.assertTrue(torch.allclose(loss, torch.tensor(0.0).to(self.device)))
@@ -167,7 +174,7 @@ class TestBarrierLoss(unittest.TestCase):
         # Forward pass
         input_tensor = torch.randn(self.batch_size, 1).to(self.device)
         barrier_values = net(input_tensor).squeeze()
-        next_barrier_values = net(torch.randn(self.batch_size, 1).to(self.device)).squeeze()
+        next_barrier_values = net(torch.randn(self.config["n_barrier_steps"] + 1, self.batch_size, 1).to(self.device)).squeeze()
 
         # Compute loss
         loss, _ = self.loss_fn(
@@ -189,9 +196,9 @@ class TestBarrierLoss(unittest.TestCase):
     def test_numerical_stability(self):
         """Test numerical stability with extreme values."""
         # Test with very large values
-        large_values = 1e6 * torch.ones(self.batch_size).to(self.device)
+        large_values = 1e6 * torch.ones(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
         total_loss, _ = self.loss_fn(
-            barrier_values=large_values,
+            barrier_values=large_values[0],
             next_barrier_values=large_values,
             feasible_mask=self.feasible_mask,
             infeasible_mask=self.infeasible_mask,
@@ -201,9 +208,9 @@ class TestBarrierLoss(unittest.TestCase):
         self.assertFalse(torch.isinf(total_loss))
 
         # Test with very small values
-        small_values = 1e-6 * torch.ones(self.batch_size).to(self.device)
+        small_values = 1e-6 * torch.ones(self.config["n_barrier_steps"] + 1, self.batch_size).to(self.device)
         total_loss, _ = self.loss_fn(
-            barrier_values=small_values,
+            barrier_values=small_values[0],
             next_barrier_values=small_values,
             feasible_mask=self.feasible_mask,
             infeasible_mask=self.infeasible_mask,

@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Any, Optional
 from dataclasses import dataclass
+
+from torch.optim import Adam
+
 from .barrier_loss import BarrierLoss, PolicyLoss, ValueLoss
 
 @dataclass
@@ -16,23 +19,70 @@ class LossInfo:
     value_loss: float
     barrier_loss: float
 
-    # Policy loss components
-    surrogate_loss: float = 0.0
-    barrier_penalty: float = 0.0
-    entropy_bonus: float = 0.0
-    kl_loss: float = 0.0
-
     # Barrier loss components
     feasible_loss: float = 0.0
     infeasible_loss: float = 0.0
     invariant_loss: float = 0.0
 
     # Additional metrics
-    policy_gradient_norm: float = 0.0
-    value_gradient_norm: float = 0.0
-    barrier_gradient_norm: float = 0.0
     lagrange_multiplier: float = 0.0
 
+
+class LagrangeMultiplier(nn.Module):
+    """
+    Learnable Lagrange multiplier with constrained optimization.
+    """
+
+    def __init__(
+            self,
+            initial_value: float = 0.1,
+            lr: float = 1e-2,
+            min_value: float = 0.0,
+            max_value: float = 1000.0
+    ):
+        """
+        Initialize Lagrange multiplier.
+
+        Args:
+            initial_value: Initial value for the multiplier
+            lr: Learning rate for the optimizer
+            min_value: Minimum value for the multiplier
+            max_value: Maximum value for the multiplier
+        """
+        super().__init__()
+        self.log_lambda = nn.Parameter(torch.log(torch.tensor(initial_value)))
+        self.min_value = min_value
+        self.max_value = max_value
+        self.optimizer = Adam([self.log_lambda], lr=lr)
+
+    @property
+    def lambda_value(self) -> torch.Tensor:
+        """Get the current value of the Lagrange multiplier."""
+        return torch.clamp(
+            torch.exp(self.log_lambda),
+            self.min_value,
+            self.max_value
+        )
+
+    def update(self, actor_loss: torch.Tensor, constraint_value: torch.Tensor) -> float:
+        """
+        Update Lagrange multiplier using gradient descent.
+
+        Args:
+            constraint_value: Current value of the constraint
+
+        Returns:
+            Current value of the Lagrange multiplier
+        """
+        # Compute dual loss: -λ * constraint
+        dual_loss = -actor_loss - self.lambda_value * constraint_value
+
+        # Update lambda
+        self.optimizer.zero_grad()
+        dual_loss.backward()
+        self.optimizer.step()
+
+        return self.lambda_value.item()
 
 class PPONBCLoss(nn.Module):
     """
@@ -183,8 +233,7 @@ class SRLNBCLoss(nn.Module):
         """
         super().__init__()
         self.lambda_barrier = config["lambda_barrier"]
-        #self.n_barrier_steps = config["n_barrier_steps"]
-        self.n_barrier_steps = 1
+        self.n_barrier_steps = config["n_barrier_steps"]
         self.gamma_barrier = config["gamma_barrier"]
         self.target_policy_noise = config["target_policy_noise"]
         self.target_noise_clip = config["target_noise_clip"]
@@ -192,8 +241,8 @@ class SRLNBCLoss(nn.Module):
         self.device = config["device"]
 
         # Initialize Lagrange multiplier
-        self.lagrange_multiplier = nn.Parameter(torch.tensor(1.0))
-        self.lambda_lr = 1e-3
+        self.lambda_lr = config.get("lambda_lr", 3e-2)
+        self.lagrange_multiplier = LagrangeMultiplier(lr=self.lambda_lr)
 
         # Initialize individual loss functions
         self.barrier_loss = BarrierLoss(config)
@@ -290,7 +339,6 @@ class SRLNBCLoss(nn.Module):
             episode_mask=episode_mask
         )
 
-
     def forward(
             self,
             barrier_values: torch.Tensor,
@@ -305,33 +353,9 @@ class SRLNBCLoss(nn.Module):
             critic_loss: torch.Tensor,
             actor_loss: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, LossInfo]:
-        """
-        Compute combined loss using Lagrangian relaxation.
-
-        Args:
-            barrier_values: Current state barrier values
-            next_barrier_values: Next state barrier values
-            feasible_mask: Binary mask indicating feasible states
-            infeasible_mask: Binary mask indicating infeasible states
-            current_policy: Current policy network
-            old_policy: Old policy network
-
-        Returns:
-            total_loss: Combined loss for optimization
-            barrier_loss: total barrier loss
-            loss_info: Detailed loss information
-        """
-
-        # Compute importance weights
-        importance_weights = self.compute_importance_weights(
-            current_policy=current_policy,
-            old_policy=old_policy,
-            observations=observations,
-            actions=actions
-        )
 
         # Compute barrier penalty
-        barrier_loss, barrier_info = self.compute_barrier_loss(
+        barrier_loss, barrier_penalty, barrier_info = self.compute_barrier_loss(
             barrier_values=barrier_values,
             next_barrier_values=next_barrier_values,
             feasible_mask=feasible_mask,
@@ -339,33 +363,26 @@ class SRLNBCLoss(nn.Module):
             episode_mask=episode_mask
         )
 
-        barrier_penalty = importance_weights * barrier_info["invariant_loss"]
+        # Get mean penalty (Lagrange multiplier)
+        mean_penalty = self.lagrange_multiplier.lambda_value.detach()
 
-        # Compute Lagrangian dual loss
-        dual_loss = self.lagrange_multiplier * barrier_penalty
+        importance_weight = self.compute_importance_weights(current_policy, old_policy, observations, actions)
 
-        # Combine losses using Lagrangian relaxation
-        actor_loss = torch.as_tensor(actor_loss, device=self.device)
-        total_loss = actor_loss + dual_loss
+        # Compute total loss using normalized penalties
+        total_loss = actor_loss + importance_weight * mean_penalty * barrier_penalty.detach()
 
-        # Update Lagrange multiplier
-        with torch.no_grad():
-            self.lagrange_multiplier.data.add_(
-                self.lambda_lr * total_loss.detach()
-            )
-            self.lagrange_multiplier.data.clamp_(min=0.0)
+        # Update Lagrange multiplier with gradient clipping
+        self.lagrange_multiplier.update(actor_loss.detach(), barrier_penalty.detach())
 
-        # Create loss info
         loss_info = LossInfo(
             total_loss=total_loss.item(),
             policy_loss=actor_loss.item(),
             value_loss=critic_loss.item(),
             barrier_loss=barrier_loss.item(),
-            barrier_penalty=barrier_penalty.item(),
             feasible_loss=barrier_info["feasible_loss"],
             infeasible_loss=barrier_info["infeasible_loss"],
             invariant_loss=barrier_info["invariant_loss"],
-            lagrange_multiplier=self.lagrange_multiplier.item(),
+            lagrange_multiplier=self.lagrange_multiplier.lambda_value.item(),
         )
 
         return total_loss, barrier_loss, loss_info

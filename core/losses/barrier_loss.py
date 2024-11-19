@@ -35,10 +35,11 @@ class BarrierLoss:
         Returns:
             Feasible region loss
         """
-        loss = torch.maximum(barrier_values, torch.zeros_like(barrier_values))
-        weighted_loss = feasible_mask * loss
+        loss = torch.maximum(barrier_values + self.epsilon, torch.zeros_like(barrier_values))
+        weighted_loss = feasible_mask.float() * loss
         # Normalize by number of feasible states
-        num_feasible = torch.maximum(torch.sum(feasible_mask), torch.ones_like(torch.sum(feasible_mask)))
+        num_feasible = torch.sum(feasible_mask)
+        num_feasible = torch.maximum(num_feasible, torch.ones_like(num_feasible))
         return torch.sum(weighted_loss) / num_feasible
 
     def infeasible_loss(self, barrier_values: torch.Tensor, infeasible_mask: torch.Tensor) -> torch.Tensor:
@@ -52,8 +53,8 @@ class BarrierLoss:
         Returns:
             Infeasible region loss
         """
-        loss = torch.maximum(-barrier_values, torch.zeros_like(barrier_values))
-        weighted_loss = infeasible_mask * loss
+        loss = torch.maximum(-barrier_values - self.epsilon, torch.zeros_like(barrier_values))
+        weighted_loss = infeasible_mask.float() * loss
         # Normalize by number of infeasible states
         num_infeasible = torch.maximum(torch.sum(infeasible_mask), torch.ones_like(torch.sum(infeasible_mask)))
         return torch.sum(weighted_loss) / num_infeasible
@@ -75,8 +76,17 @@ class BarrierLoss:
         Returns:
             Multi-step invariant loss
         """
+        assert next_barrier_values.shape[0] == self.n_barrier_steps + 1, \
+            f"The expected shape of next_barrier_values is {(self.n_barrier_steps + 1, barrier_values.shape)}, but the input is {next_barrier_values.shape}"
+        assert next_barrier_values.shape[1:] == barrier_values.shape, \
+            f"The expected shape of next_barrier_values is {(self.n_barrier_steps + 1, barrier_values.shape)}, but the input is {next_barrier_values.shape}"
+        assert episode_mask.shape[0] == self.n_barrier_steps + 1, \
+            f"The expected shape of next_barrier_values is {(self.n_barrier_steps + 1, barrier_values.shape)}, but the input is {next_barrier_values.shape}"
+
+
         total_invariant_loss = 0
         batch_size = barrier_values.shape[0]
+        normalization = 0
 
         # Convert episode mask to boolean and handle shifting
         mask = episode_mask.bool()
@@ -89,8 +99,8 @@ class BarrierLoss:
             epsilon_term = self.epsilon * (1 - target_coeff) / self.lambda_barrier
 
             # Get relevant slices of barrier values
-            future_barriers = next_barrier_values
-            current_barriers = barrier_values
+            future_barriers = next_barrier_values[i+1:]
+            current_barriers = next_barrier_values[:-i-1]
 
             # Compute invariant constraint violation
             inv_loss = torch.maximum(
@@ -99,17 +109,18 @@ class BarrierLoss:
             )
 
             # Apply episode boundary mask
-            inv_loss = (1 - mask.float()) * inv_loss
-
-            # Update mask for next step
-            #if i < self.n_barrier_steps - 1:
-            #    mask = mask[:-1] | mask[1:]
+            inv_loss = (1 - mask[:-i-1].float()) * inv_loss
 
             # Compute mean loss for this step
             step_loss = torch.mean(inv_loss)
 
             # Add to total loss with gamma decay
             total_invariant_loss += (self.gamma_barrier ** i) * step_loss
+
+            mask[:-i-1] = mask[:-i-1] | mask[i+1:]
+
+            #normalization += self.gamma_barrier ** i
+
 
         # Normalize multi-step loss
         normalization = (1 - self.gamma_barrier) / (1 - self.gamma_barrier ** self.n_barrier_steps)
@@ -155,7 +166,7 @@ class BarrierLoss:
             "barrier_loss": total_loss.item()
         }
 
-        return total_loss, loss_dict
+        return total_loss, inv_loss, loss_dict
 
 
 class PolicyLoss:
