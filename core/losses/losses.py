@@ -35,10 +35,10 @@ class LagrangeMultiplier(nn.Module):
 
     def __init__(
             self,
-            initial_value: float = 0.1,
+            initial_value: float = 10,
             lr: float = 1e-2,
             min_value: float = 0.0,
-            max_value: float = 1000.0
+            max_value: float = 10000.0
     ):
         """
         Initialize Lagrange multiplier.
@@ -249,10 +249,8 @@ class SRLNBCLoss(nn.Module):
 
     def compute_importance_weights(
             self,
-            current_policy: nn.Module,
-            old_policy: nn.Module,
-            observations: torch.Tensor,
-            actions: torch.Tensor
+            current_actions: torch.Tensor,
+            old_actions: torch.Tensor,
     ) -> torch.Tensor:
         """
         Compute importance sampling weights.
@@ -268,19 +266,17 @@ class SRLNBCLoss(nn.Module):
         """
 
         with torch.no_grad():
-            current_log_prob = self._get_log_prob(current_policy, observations, actions)
-            old_log_prob = self._get_log_prob(old_policy, observations, actions)
-            importance_weights = torch.exp(current_log_prob - old_log_prob)
+            log_prob = self._get_log_prob(current_actions, old_actions)
+            importance_weights = torch.exp(log_prob)
 
             # Clip importance weights for stability
-            importance_weights = torch.clamp(importance_weights, 0.1, 10.0)
+            importance_weights = torch.clamp(importance_weights, 0.1, 1.0)
 
         return importance_weights.mean()
 
-    def _get_log_prob(self, policy: nn.Module, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def _get_log_prob(self, current_actions: torch.Tensor, old_actions: torch.Tensor) -> torch.Tensor:
         """log probability computation."""
-        mean = policy.forward(obs)
-        return -0.5 * ((actions - mean) ** 2).sum(dim=-1)
+        return -0.5 * ((current_actions - old_actions) ** 2).sum(dim=-1)
 
     def compute_barrier_penalty(
             self,
@@ -345,14 +341,12 @@ class SRLNBCLoss(nn.Module):
             next_barrier_values: torch.Tensor,
             feasible_mask: torch.Tensor,
             infeasible_mask: torch.Tensor,
-            observations: torch.Tensor,
             episode_mask: torch.Tensor,
-            actions: torch.Tensor,
-            current_policy: nn.Module,
-            old_policy: nn.Module,
+            current_actions: nn.Module,
+            old_actions: nn.Module,
             critic_loss: torch.Tensor,
             actor_loss: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, LossInfo]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, LossInfo]:
 
         # Compute barrier penalty
         barrier_loss, barrier_penalty, barrier_info = self.compute_barrier_loss(
@@ -366,13 +360,10 @@ class SRLNBCLoss(nn.Module):
         # Get mean penalty (Lagrange multiplier)
         mean_penalty = self.lagrange_multiplier.lambda_value.detach()
 
-        importance_weight = self.compute_importance_weights(current_policy, old_policy, observations, actions)
+        importance_weight = self.compute_importance_weights(current_actions, old_actions)
 
         # Compute total loss using normalized penalties
-        total_loss = actor_loss + importance_weight * mean_penalty * barrier_penalty.detach()
-
-        # Update Lagrange multiplier with gradient clipping
-        self.lagrange_multiplier.update(actor_loss.detach(), barrier_penalty.detach())
+        total_loss = actor_loss + mean_penalty * (importance_weight * barrier_penalty.detach())
 
         loss_info = LossInfo(
             total_loss=total_loss.item(),
@@ -385,7 +376,7 @@ class SRLNBCLoss(nn.Module):
             lagrange_multiplier=self.lagrange_multiplier.lambda_value.item(),
         )
 
-        return total_loss, barrier_loss, loss_info
+        return total_loss, barrier_loss, importance_weight * barrier_penalty, loss_info
 
 class SRLNBCLossWrapper:
     """

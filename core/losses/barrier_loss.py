@@ -24,6 +24,13 @@ class BarrierLoss:
         self.n_barrier_steps = config["n_barrier_steps"]
         self.gamma_barrier = config["gamma_barrier"]
 
+        self.step_weights = torch.tensor(
+            [config["gamma_barrier"] ** (n - 1) for n in range(1, config["n_barrier_steps"] + 1)],
+            dtype=torch.float32
+        )
+        self.normalizing_factor = self.step_weights.sum()
+        self.step_weights = self.step_weights / self.normalizing_factor
+
     def feasible_loss(self, barrier_values: torch.Tensor, feasible_mask: torch.Tensor) -> torch.Tensor:
         """
         Compute loss for feasible states (barrier value should be <= 0).
@@ -35,7 +42,7 @@ class BarrierLoss:
         Returns:
             Feasible region loss
         """
-        loss = torch.maximum(barrier_values + self.epsilon, torch.zeros_like(barrier_values))
+        loss = torch.maximum(barrier_values, torch.zeros_like(barrier_values))
         weighted_loss = feasible_mask.float() * loss
         # Normalize by number of feasible states
         num_feasible = torch.sum(feasible_mask)
@@ -53,7 +60,7 @@ class BarrierLoss:
         Returns:
             Infeasible region loss
         """
-        loss = torch.maximum(-barrier_values - self.epsilon, torch.zeros_like(barrier_values))
+        loss = torch.maximum(-barrier_values, torch.zeros_like(barrier_values))
         weighted_loss = infeasible_mask.float() * loss
         # Normalize by number of infeasible states
         num_infeasible = torch.maximum(torch.sum(infeasible_mask), torch.ones_like(torch.sum(infeasible_mask)))
@@ -85,8 +92,6 @@ class BarrierLoss:
 
 
         total_invariant_loss = 0
-        batch_size = barrier_values.shape[0]
-        normalization = 0
 
         # Convert episode mask to boolean and handle shifting
         mask = episode_mask.bool()
@@ -120,7 +125,6 @@ class BarrierLoss:
             mask[:-i-1] = mask[:-i-1] | mask[i+1:]
 
             #normalization += self.gamma_barrier ** i
-
 
         # Normalize multi-step loss
         normalization = (1 - self.gamma_barrier) / (1 - self.gamma_barrier ** self.n_barrier_steps)

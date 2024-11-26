@@ -1,0 +1,8 @@
+{
+    "timestep": 150000,
+    "mean_reward": 35.74325838788027,
+    "mean_cost": 63.6,
+    "success_rate": 0.0,
+    "combined_score": 3.9432583878802667,
+    "criterion": "reward"
+}

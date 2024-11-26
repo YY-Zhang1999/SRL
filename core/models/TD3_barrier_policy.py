@@ -59,7 +59,7 @@ class SafeTD3Policy(TD3Policy):
         )
 
         # barrier network parameters
-        barrier_arch = get_actor_critic_barrier_arch(net_arch)[2] if net_arch else [400, 300]
+        barrier_arch = get_actor_critic_barrier_arch(net_arch)[2] if net_arch else [64, 64]
 
         self.barrier_kwargs = {
             "observation_space": self.observation_space,
@@ -116,7 +116,6 @@ class SafeTD3Policy(TD3Policy):
         # Target networks should always be in eval mode
         self.actor_target.set_training_mode(False)
         self.critic_target.set_training_mode(False)
-        self.barrier_net.set_training_mode(False)
 
     def make_barrier(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> BarrierNetwork:
         #barrier_kwargs = self._update_features_extractor(self.barrier_kwargs, features_extractor)
@@ -126,6 +125,7 @@ class SafeTD3Policy(TD3Policy):
         """Set training mode."""
         self.actor.set_training_mode(mode)
         self.critic.set_training_mode(mode)
+        self.barrier_net.set_training_mode(mode)
         self.training = mode
 
 def get_actor_critic_barrier_arch(net_arch: Union[List[int], Dict[str, List[int]]]) -> Tuple[List[int], List[int], List[int]]:

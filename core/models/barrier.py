@@ -1,5 +1,5 @@
 import warnings
-from typing import Dict, List, Tuple, Type, Union, Optional
+from typing import Dict, List, Tuple, Type, Union, Optional, Any
 from functools import partial
 
 import gym
@@ -35,9 +35,10 @@ class BarrierNetwork(BasePolicy):
             action_space: gym.spaces.Space,
             features_extractor: Type[BaseFeaturesExtractor] = FlattenExtractor,
             features_dim: int = None,
-            hidden_sizes: List[int] = [64, 64],
+            hidden_sizes: List[int] = [400, 300],
             normalize_images: bool = True,
-            device: Union[torch.device, str] = "auto",
+            optimizer_class: Type[torch.optim.Optimizer] = torch.optim.Adam,
+            optimizer_kwargs: Optional[Dict[str, Any]] = None,
             **kwargs
     ):
         """
@@ -52,6 +53,12 @@ class BarrierNetwork(BasePolicy):
             device: Device to use for computation
             **kwargs: Additional arguments for feature extractor
         """
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == torch.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
         super().__init__(
             observation_space,
             action_space,
@@ -127,7 +134,7 @@ class BarrierNetwork(BasePolicy):
             Barrier values for given states
         """
         # Extract features
-        features = self.features_extractor(observations)
+        features = self.extract_features(observations, self.features_extractor)
 
         # Compute barrier values
         barrier_values = self.barrier_net(features)

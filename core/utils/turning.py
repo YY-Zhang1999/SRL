@@ -88,10 +88,10 @@ class SafeTD3Optimizer:
             "policy": "SafeTD3Policy",
             "env": env,
             "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
-            "buffer_size": 20_0000, #trial.suggest_int("buffer_size", 100000, 1000000),
+            "buffer_size": 10_0000, #trial.suggest_int("buffer_size", 100000, 1000000),
             "learning_starts": trial.suggest_int("learning_starts", 5000, 20000),
-            "batch_size": 64 * trial.suggest_int("batch_size", 1, 8),
-            #"tau": trial.suggest_float("tau", 0.001, 0.01),
+            "batch_size": 128, #* trial.suggest_int("batch_size", 1, 8),
+            "tau": trial.suggest_float("tau", 0.001, 0.01),
             #"gamma": trial.suggest_float("gamma", 0.95, 0.999),
             "train_freq": 1,
             "gradient_steps": trial.suggest_int("gradient_steps", 1, 10),
@@ -102,7 +102,7 @@ class SafeTD3Optimizer:
             # Barrier certificate parameters
             "barrier_lambda": trial.suggest_float("barrier_lambda", 0.05, 0.2),
             "n_barrier_steps": trial.suggest_int("n_barrier_steps", 10, 20),
-            #"gamma_barrier": trial.suggest_float("gamma_barrier", 0.95, 0.999),
+            "gamma_barrier": trial.suggest_float("gamma_barrier", 0.9, 0.999),
             #"safety_margin": trial.suggest_float("safety_margin", 0.05, 0.2),
             "lambda_lr": trial.suggest_float("lambda_lr", 1e-4, 1e-2, log=True),
         }
@@ -127,6 +127,7 @@ class SafeTD3Optimizer:
         """
         # Sample parameters
         params = self.sample_params(trial)
+        
 
         try:
             # Training
@@ -197,7 +198,7 @@ class SafeTD3Optimizer:
 if __name__ == "__main__":
     # Example usage
     optimizer = SafeTD3Optimizer(
-        env_id="SafetyCarCircle1-v0",
+        env_id="SafetyCarGoal1-v0",
         n_trials=50,
         n_timesteps=100000,
         study_name="safe_td3_optimization",
